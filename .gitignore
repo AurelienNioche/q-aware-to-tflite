@@ -4,3 +4,6 @@
 .idea
 .pytest_cache
 .mypy_cache
+# model files
+model_int8_quant.tflite
+float_model.h5

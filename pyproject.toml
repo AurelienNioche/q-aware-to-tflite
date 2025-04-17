@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "quantize-aware-tflite"
+version = "0.1.0"
+description = "Example of PyTorch to quantized TFLite conversion using Nobuco and PTQ"
+readme = "README.md" # Optional: Add a README file later
+requires-python = ">=3.10,<3.11"
+
+dependencies = [
+    "torch==2.5.1",
+    "torchvision==0.20.1",
+    "nobuco==0.17.0",
+    # Nobuco 0.17 requires Keras 2, so TF must be <= 2.15
+    "tensorflow-macos==2.15.0", 
+    # "tensorflow-metal==1.2.0", # Keep commented for Keras 2
+    "keras==2.15.0", # Use Keras 2
+    # Pin NumPy < 2.0 for TensorFlow compatibility
+    "numpy<2.0,>=1.26.4",
+]
