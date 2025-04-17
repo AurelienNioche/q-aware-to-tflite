@@ -10,13 +10,18 @@ readme = "README.md" # Optional: Add a README file later
 requires-python = ">=3.10,<3.11"
 
 dependencies = [
-    "torch==2.5.1",
-    "torchvision==0.20.1",
-    "nobuco==0.17.0",
-    # Nobuco 0.17 requires Keras 2, so TF must be <= 2.15
-    "tensorflow-macos==2.15.0", 
-    # "tensorflow-metal==1.2.0", # Keep commented for Keras 2
-    "keras==2.15.0", # Use Keras 2
-    # Pin NumPy < 2.0 for TensorFlow compatibility
-    "numpy<2.0,>=1.26.4",
+    "tensorflow == 2.15.0",
+    "tf-keras == 2.15.0",
+    "tensorflow-probability == 0.22.1",
+    "numpy < 2.0", # Pin to < 2.0 for TF 2.15 compatibility
+    "h5py", # Version resolved by installer
+    "torch", # Version resolved by installer
+    "onnx == 1.17.0",
+    "onnx2tf == 1.27.2",
+    "onnx-graphsurgeon == 0.5.8",
+    "psutil == 7.0.0",
+    "ai-edge-litert == 1.2.0",
+    "sng4onnx == 1.0.4",
 ]
+
+# Removed old Nobuco/TF-Metal/Torchvision dependencies

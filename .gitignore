@@ -7,3 +7,10 @@
 # model files
 model_int8_quant.tflite
 float_model.h5
+# random test files
+test.py
+# Ignore egg-info
+.egg-info
+/quantize_aware_tflite.egg-info/
+/conversion_output/
+/i8/

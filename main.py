@@ -1,165 +1,154 @@
-import keras
-import nobuco
-import tensorflow as tf
 import torch
-from nobuco import ChannelOrder, ChannelOrderingStrategy
-# from nobuco.converters.type_cast import dtype_pytorch2keras # Not needed if not mapping types
-# from tensorflow.lite.python.lite import TFLiteConverter # Use tf.lite directly
-from torch import nn # , ops # ops not needed if not using quantized ops
-import numpy as np
+from torch import nn
+import torch.quantization
+import torch.onnx
+import os
 
-# # Set the quantized engine for Apple Silicon - Not needed if not using PyTorch quantized ops
-# if torch.backends.mps.is_available():
-#     try:
-#         torch.backends.quantized.engine = 'qnnpack'
-#         print("Quantized engine set to 'qnnpack'")
-#     except AttributeError:
-#         print("Warning: Could not set quantized engine. This PyTorch version might not support it.")
-# else:
-#     # You might want a different default for non-MPS systems if needed
-#     pass
+# Set quantization backend
+torch.backends.quantized.engine = 'qnnpack'
+print(f"Quantized engine set to: {torch.backends.quantized.engine}")
 
+import tensorflow as tf
+from tensorflow.lite.python.lite import TFLiteConverter
 
-class Identity(nn.Module):
-    def forward(self, x):
-        return x
-
-# Standard Float Model - Remove PyTorch Quantization
 class Model(nn.Module):
     def __init__(self, weight, bias):
         super().__init__()
-        # Store standard float weights and bias
-        self.register_parameter('weight', nn.Parameter(weight))
-        if bias is not None:
-            self.register_parameter('bias', nn.Parameter(bias))
-        else:
-            self.register_parameter('bias', None)
+        self.linear = nn.Linear(weight.shape[1], weight.shape[0])
+        self.linear.weight.data = weight
+        self.linear.bias.data = bias
+        self.quant = torch.quantization.QuantStub()
+        self.dequant = torch.quantization.DeQuantStub()
 
     def forward(self, x: torch.Tensor):
-        # Use standard nn.Linear
-        x = nn.functional.linear(x, self.weight, self.bias)
+        x = self.quant(x)
+        x = self.linear(x)
+        x = self.dequant(x)
         return x
 
-# --- Remove Nobuco converters for quantized ops --- 
-# @nobuco.converter(...)
-# def converter_quantize_per_tensor(...):
-#     ...
+weight = torch.rand((100, 100))
+bias = torch.rand((100,))
+model_fp32 = Model(weight, bias)
 
-# @nobuco.converter(...)
-# def converter_dequantize(...):
-#     ...
+model_fp32.train()
 
-# @nobuco.converter(...)
-# def converter_linear_quantized(...):
-#     ...
-# --- Nobuco will use its default converter for nn.Linear --- 
+# Specify quantization configuration
+# 'fbgemm' for x86, 'qnnpack' for ARM. Use get_default_qat_qconfig for simplicity
+qconfig = torch.quantization.get_default_qat_qconfig('qnnpack') # Or 'fbgemm'
+model_fp32.qconfig = qconfig
 
-weight_float = torch.rand((100, 100))
-bias_float = torch.rand((100,))
-model = Model(weight_float, bias_float)
+# Prepare the model for QAT. This inserts observers.
+model_qat = torch.quantization.prepare_qat(model_fp32)
 
-x_float = torch.rand(size=(1, 100)) * 200 - 100
+print("Running calibration passes...")
+x_dummy = torch.rand(size=(1, 100)) * 200 - 100
+for _ in range(10):
+    model_qat(x_dummy)
+print("Calibration done.")
 
-# Convert the FLOAT model using Nobuco
-print("Converting float PyTorch model to Keras...")
-keras_model = nobuco.pytorch_to_keras(
-    model,
-    args=[x_float],
-    inputs_channel_order=ChannelOrder.TENSORFLOW,
-    outputs_channel_order=ChannelOrder.TENSORFLOW,
+model_qat.eval()
+model_int8 = torch.quantization.convert(model_qat)
+print("Model converted to INT8.")
+
+# --- Define Output Folder and Paths ---
+output_folder = 'conversion_output' # << CHANGE THIS TO CONTROL OUTPUT FOLDER NAME
+os.makedirs(output_folder, exist_ok=True)
+
+onnx_model_path = os.path.join(output_folder, 'quant_qat.onnx')
+tflite_model_path = os.path.join(output_folder, 'quant_qat_int8.tflite') # Renamed for clarity
+tf_model_output_dir = output_folder # onnx2tf outputs SavedModel directly into the specified folder
+
+# --- Export to ONNX ---
+print(f"Exporting QAT model to ONNX: {onnx_model_path}")
+torch.onnx.export(
+    model_int8,
+    x_dummy,
+    onnx_model_path,
+    export_params=True,
+    opset_version=13,
+    do_constant_folding=True,
+    input_names = ['input'],
+    output_names = ['output'],
+    dynamic_axes={'input' : {0 : 'batch_size'},
+                  'output' : {0 : 'batch_size'}}
 )
-print("Keras float model conversion successful.")
+print("ONNX export complete.")
 
-model_path_float = "float_model"
-keras_model.save(model_path_float + ".h5")
-print(f"Keras float model saved to {model_path_float}.h5")
+# --- TFLite Conversion using onnx2tf ---
 
-# --- TFLite Post-Training Quantization --- 
-
-print("\nStarting TFLite conversion with Post-Training Quantization...")
-
-# Define the representative dataset using FLOAT data
-def representative_dataset_gen():
-  for _ in range(100): # Use a reasonable number of samples
-    # Generate float data representative of the actual input range
-    yield [ (torch.rand(size=(1, 100)) * 200 - 100).numpy().astype(np.float32) ]
-
-# Convert the Keras FLOAT model to TFLite INT8
-converter = tf.lite.TFLiteConverter.from_keras_model(keras_model)
-
-# Enable default optimizations (includes quantization)
-converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-# Provide the representative dataset (essential for calibration)
-converter.representative_dataset = representative_dataset_gen
-
-# Ensure integer-only quantization is enforced
-# This requires representative_dataset
-converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-# Specify input/output types for the final TFLite model
-converter.inference_input_type = tf.int8  # Model will expect int8 input
-converter.inference_output_type = tf.int8 # Model will produce int8 output
-
+print("Attempting ONNX to TFLite conversion using onnx2tf...")
 
 try:
-    print("Running TFLite converter...")
-    tflite_quant_model = converter.convert()
-    output_quant_path = "model_int8_quant.tflite"
-    with open(output_quant_path, "wb") as f:
-        f.write(tflite_quant_model)
-    print(f"Successfully converted and saved INT8 TFLite model to {output_quant_path}")
-
-    # --- Verification --- 
-    print("\nVerifying TFLite model...")
-    interpreter = tf.lite.Interpreter(model_path=output_quant_path)
-    interpreter.allocate_tensors()
-
-    input_details = interpreter.get_input_details()[0]
-    output_details = interpreter.get_output_details()[0]
-
-    print("TFLite Input Details:", input_details)
-    print("TFLite Output Details:", output_details)
-
-    # Prepare sample input: quantize float input according to TFLite input specs
-    sample_float_input = (torch.rand(size=(1, 100)) * 200 - 100).numpy().astype(np.float32)
-    input_scale, input_zero_point = input_details['quantization']
-    print(f"Input scale: {input_scale}, Input zero-point: {input_zero_point}")
-    if input_scale == 0 and input_zero_point == 0:
-        print("Warning: Input quantization parameters are zero. Input might not be quantized.")
-        tflite_input = sample_float_input.astype(input_details['dtype'])
-    else:
-        tflite_input = (sample_float_input / input_scale + input_zero_point).astype(input_details['dtype'])
-
-
-    # Run inference
-    interpreter.set_tensor(input_details['index'], tflite_input)
-    interpreter.invoke()
-    tflite_output_quant = interpreter.get_tensor(output_details['index'])
-
-    # Dequantize output for comparison
-    output_scale, output_zero_point = output_details['quantization']
-    print(f"Output scale: {output_scale}, Output zero-point: {output_zero_point}")
-    if output_scale == 0 and output_zero_point == 0:
-        print("Warning: Output quantization parameters are zero. Output might not be quantized.")
-        tflite_output_float = tflite_output_quant.astype(np.float32)
-    else:
-        tflite_output_float = (tflite_output_quant.astype(np.float32) - output_zero_point) * output_scale
-
-    print("Sample TFLite Input (quantized):")
-    print(tflite_input)
-    print("\nSample TFLite Output (dequantized):")
-    print(tflite_output_float)
-
-    # Compare with original PyTorch float model output (optional)
-    # with torch.no_grad():
-    #    pytorch_output = model(torch.from_numpy(sample_float_input)).numpy()
-    # print("\nOriginal PyTorch output (float):")
-    # print(pytorch_output)
-    # diff = np.mean(np.abs(pytorch_output - tflite_output_float))
-    # print(f"\nMean Absolute Difference: {diff}")
-
+    # Construct the onnx2tf command
+    # -i: input ONNX path
+    # -o: output directory (where SavedModel and float tflite files go)
+    # -oi8: quantize to INT8 (influences SavedModel internals)
+    conversion_cmd = f'onnx2tf -i {onnx_model_path} -o {tf_model_output_dir} -oi8'
+    print(f"Running command: {conversion_cmd}")
+    conversion_status = os.system(conversion_cmd)
 
 except Exception as e:
-    print(f"\nError during TFLite conversion or verification: {e}")
-    import traceback
-    traceback.print_exc()
+    print(f"onnx2tf conversion failed with status code: {conversion_status}")
+
+if conversion_status == 0:
+    # Despite -o flag, onnx2tf with -oi8 seems to create SavedModel in CWD/i8
+    saved_model_dir_actual = 'i8' # Correct path where SavedModel is actually created
+    print(f"onnx2tf conversion successful (Generated SavedModel in '{saved_model_dir_actual}').")
+
+# --- Move FP16/FP32 TFLite files generated by onnx2tf to output folder ---
+print("Moving FP16/FP32 TFLite files...")
+onnx_basename = os.path.splitext(os.path.basename(onnx_model_path))[0]
+fp16_src = os.path.join(saved_model_dir_actual, f'{onnx_basename}_float16.tflite')
+fp32_src = os.path.join(saved_model_dir_actual, f'{onnx_basename}_float32.tflite')
+fp16_dst = os.path.join(output_folder, f'{onnx_basename}_float16.tflite')
+fp32_dst = os.path.join(output_folder, f'{onnx_basename}_float32.tflite')
+
+try:
+    if os.path.exists(fp16_src):
+        os.rename(fp16_src, fp16_dst)
+        print(f"Moved {fp16_src} to {fp16_dst}")
+    else:
+        print(f"Warning: {fp16_src} not found, skipping move.")
+    if os.path.exists(fp32_src):
+        os.rename(fp32_src, fp32_dst)
+        print(f"Moved {fp32_src} to {fp32_dst}")
+    else:
+        print(f"Warning: {fp32_src} not found, skipping move.")
+except OSError as e:
+    print(f"Error moving TFLite files: {e}")
+
+# --- Convert the INT8 SavedModel to TFLite using TFLiteConverter ---
+print("Converting INT8 SavedModel to TFLite...")
+try:
+    # Representative dataset generator
+    def representative_dataset_gen():
+        # Use data similar to the calibration/dummy data
+        # Important: Must match the input signature of the SavedModel
+        # Check the SavedModel signature if unsure, but it's likely float32 here
+        num_samples = 100 # Number of samples for calibration
+        for _ in range(num_samples):
+            # Create data matching the expected input shape (e.g., [1, 100]) and type (float32)
+            data = tf.random.uniform([1, 100], minval=-100, maxval=100, dtype=tf.float32)
+            yield [data] # Yield a list of input tensors
+
+    # Load from the actual SavedModel location ('i8')
+    converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir_actual)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_dataset_gen # Assign the generator
+    # Specify INT8 input/output types for the final TFLite model
+    # onnx2tf with -oi8 likely prepared the model for int8
+    # Check model signature if specific types (uint8 vs int8) are needed
+    converter.inference_input_type = tf.int8 # Use int8 as default for -oi8
+    converter.inference_output_type = tf.int8
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+
+    tflite_model = converter.convert()
+    print("TFLite INT8 conversion successful.")
+    with open(tflite_model_path, 'wb') as f:
+        f.write(tflite_model)
+    print(f"Quantized INT8 TFLite model saved to {tflite_model_path}")
+
+except Exception as e:
+    print(f"TFLite conversion failed: {e}")
+
+print("Script finished.")
